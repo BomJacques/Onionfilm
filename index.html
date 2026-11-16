@@ -314,13 +314,23 @@ async function makeZip(files) {           // files: [{name, blob}]; stored uncom
   end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
   return new Blob([...parts, ...central, end], { type: 'application/zip' });
 }
-async function saveAll() {
-  if (!frames.length) return;
-  if (frames.length === 1) return download(frames[0].blob, frameName(0, frames[0]));
+async function shareFiles(list) {       // iOS/Android share sheet: "Save Image(s)" puts them in Photos
+  if (!navigator.canShare) return false;
+  const files = list.map(x => new File([x.blob], x.name, { type: x.blob.type || 'image/jpeg' }));
+  if (!navigator.canShare({ files })) return false;
+  try { await navigator.share({ files }); }
+  catch (e) { if (e.name !== 'AbortError') return false; }
+  return true;
+}
+async function saveFrames(list) {
+  if (!list.length) return;
+  if (await shareFiles(list)) return;
+  if (list.length === 1) return download(list[0].blob, list[0].name);
   const btn = $('saveAll'); btn.disabled = true; btn.textContent = 'Zipping';
-  try { download(await makeZip(frames.map((f, i) => ({ name: frameName(i, f), blob: f.blob }))), 'onion-skin-frames.zip'); }
+  try { download(await makeZip(list), 'onion-skin-frames.zip'); }
   finally { btn.disabled = false; btn.textContent = 'Save all'; }
 }
+function saveAll() { return saveFrames(frames.map((f, i) => ({ name: frameName(i, f), blob: f.blob }))); }
 
 /* ---------- controls ---------- */
 const confirms = [['delOne', 'Delete'], ['clear', 'Clear']];
@@ -342,7 +352,7 @@ $('modeDiff').onclick = () => { mode = 'diff'; applyOverlay(); };
 $('modeOff').onclick = () => { mode = 'off'; applyOverlay(); };
 $('opacity').oninput = applyOverlay;
 $('unpin').onclick = () => { pinned = null; render(); };
-$('saveOne').onclick = () => { const i = frames.findIndex(f => f.id === pinned); if (i >= 0) download(frames[i].blob, frameName(i, frames[i])); };
+$('saveOne').onclick = () => { const i = frames.findIndex(f => f.id === pinned); if (i >= 0) saveFrames([{ name: frameName(i, frames[i]), blob: frames[i].blob }]); };
 twoTap('delOne', () => removeFrame(pinned));
 twoTap('clear', clearAll);
 $('saveAll').onclick = saveAll;
