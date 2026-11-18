@@ -45,6 +45,12 @@
   #player, #reviewImg { background: #000; }
   .badge { position: absolute; left: 12px; top: calc(12px + env(safe-area-inset-top)); padding: 4px 10px;
     border-radius: 999px; background: rgba(0,0,0,.6); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .autobtn { position: absolute; right: 12px; top: calc(10px + env(safe-area-inset-top)); padding: 5px 12px; border-radius: 999px;
+    background: rgba(0,0,0,.6); border: 1px solid rgba(255,255,255,.25); font-size: 13px; }
+  .autobtn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #1a1200; font-weight: 600; }
+  .autostat { position: absolute; left: 12px; top: calc(46px + env(safe-area-inset-top)); padding: 4px 10px; border-radius: 999px;
+    background: rgba(0,0,0,.6); font-size: 13px; font-variant-numeric: tabular-nums; max-width: calc(100% - 24px); }
+  .autostat.go { background: var(--accent); color: #1a1200; font-weight: 600; }
   .flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
   .flash.on { animation: flash .25s ease-out; }
   @keyframes flash { from { opacity: .7; } to { opacity: 0; } }
@@ -153,6 +159,8 @@
     </div>
     <div class="flash" id="flash"></div>
     <div class="badge" id="badge">0 frames</div>
+    <button class="autobtn" id="autoBtn" aria-pressed="false">Auto</button>
+    <div class="autostat" id="autoStat" hidden></div>
     <div class="msg" id="msg">
       <p id="msgText">Line up each new photo against a see-through copy of an earlier one.</p>
       <button class="primary" id="start">Start camera</button>
@@ -199,6 +207,9 @@
       <h3>Lining up</h3>
       <label class="check"><input type="checkbox" id="lockFirst" data-set="lockFirst"> Always align to the first photo</label>
       <label class="check"><input type="checkbox" id="reviewOn" data-set="review"> Check each photo before keeping it</label>
+      <div class="row"><label for="autoThr">Match at</label><input type="range" id="autoThr" data-set="autoThr" min="50" max="95"><span class="val" id="autoThrVal"></span></div>
+      <div class="row"><label for="autoHold">Hold still</label><input type="range" id="autoHold" data-set="autoHold" min="0.5" max="3" step="0.5"><span class="val" id="autoHoldVal"></span></div>
+      <p class="note">Auto (top right of the camera) takes one photo once the live view matches the reference around anchor points A and B and stays steady for the hold time. Lower the match if it never triggers; raise it if it fires too early.</p>
       <p class="note" id="anchorInfo"></p>
       <div class="btns"><button class="small" id="editAnchors">Set anchor points</button></div>
 
@@ -262,7 +273,7 @@ let db = null, localId = 0;
 let seqToken = 0, playing = false, videoBlob = null, rendering = false, prep = null;
 
 /* ---------- settings ---------- */
-const S = { fps: 6, hold: 1, xf: 0, crop: 5, lockFirst: true, review: true, align: true, matchSize: true, colour: true, date: false };
+const S = { autoThr: 75, autoHold: 1, fps: 6, hold: 1, xf: 0, crop: 5, lockFirst: true, review: true, align: true, matchSize: true, colour: true, date: false };
 function getSet(k, d) { try { const v = localStorage.getItem('osc.' + k); return v === null ? d : v; } catch (e) { return d; } }
 function putSet(k, v) { try { localStorage.setItem('osc.' + k, v); } catch (e) {} }
 function loadSettings(obj) {
@@ -439,6 +450,8 @@ function updateInfo() {
   const cam = video.videoWidth ? video.videoWidth + ' × ' + video.videoHeight : '';
   $('badge').textContent = n + (n === 1 ? ' frame' : ' frames') + (cam ? ' · ' + cam : '');
   $('projInfo').textContent = n + (n === 1 ? ' photo' : ' photos') + ' in this project' + (cam ? '. Camera is shooting at ' + cam + ' pixels.' : '.');
+  $('autoThrVal').textContent = S.autoThr + '%';
+  $('autoHoldVal').textContent = S.autoHold + ' s';
   $('fpsVal').textContent = S.fps + ' fps';
   $('holdVal').textContent = S.hold + ' s';
   $('xfVal').textContent = S.xf ? S.xf + '%' : 'Off';
@@ -807,6 +820,78 @@ function saveVideo() {
   saveOut([{ blob: videoBlob, name: safeName() + (videoBlob.type === 'video/mp4' ? '.mp4' : '.webm') }]);
 }
 
+/* ---------- auto capture: take the photo when the live view matches the reference ---------- */
+const AW = 240;                                  // size the comparison is done at
+const probe = document.createElement('canvas'), pg = probe.getContext('2d', { willReadFrequently: true });
+let auto = false, autoTimer = null, autoBusy = false, autoRef = null, holdStart = 0, audio = null;
+function toGray(d) { const o = new Float32Array(d.length / 4); for (let i = 0, j = 0; i < d.length; i += 4, j++) o[j] = .299 * d[i] + .587 * d[i + 1] + .114 * d[i + 2]; return o; }
+function patchRects(pts, AH) {                   // squares around A and B, or the middle of the picture if there are no anchors
+  const cl = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  if (!pts) return [{ x0: Math.round(AW * .2), y0: Math.round(AH * .2), x1: Math.round(AW * .8), y1: Math.round(AH * .8) }];
+  const h = Math.round(AW * .11);
+  return pts.map(q => { const cx = Math.round(q.x * AW), cy = Math.round(q.y * AH);
+    return { x0: cl(cx - h, 0, AW - 2), y0: cl(cy - h, 0, AH - 2), x1: cl(cx + h, 1, AW - 1), y1: cl(cy + h, 1, AH - 1) }; });
+}
+function ncc(a, b, r) {                          // brightness-proof similarity of one patch, -1 to 1
+  let n = 0, sa = 0, sb = 0;
+  for (let y = r.y0; y < r.y1; y++) for (let x = r.x0; x < r.x1; x++) { const i = y * AW + x; sa += a[i]; sb += b[i]; n++; }
+  if (!n) return 0;
+  const ma = sa / n, mb = sb / n; let c = 0, va = 0, vb = 0;
+  for (let y = r.y0; y < r.y1; y++) for (let x = r.x0; x < r.x1; x++) { const i = y * AW + x, da = a[i] - ma, db = b[i] - mb; c += da * db; va += da * da; vb += db * db; }
+  return va < 1 || vb < 1 ? 0 : c / Math.sqrt(va * vb);
+}
+function matchScore(a, b, rects) { return Math.max(0, Math.min(...rects.map(r => ncc(a, b, r)))); }   // the weaker patch decides
+async function autoPrepRef(ref, AH) {
+  if (autoRef && autoRef.id === ref.id && autoRef.AH === AH && autoRef.pts === ref.pts) return autoRef;
+  const im = await loadImg(ref.url);
+  const bad = Math.abs(im.naturalWidth / im.naturalHeight / (video.videoWidth / video.videoHeight) - 1) > .03;
+  probe.width = AW; probe.height = AH; pg.drawImage(im, 0, 0, AW, AH);
+  autoRef = { id: ref.id, AH, pts: ref.pts, bad, gray: toGray(pg.getImageData(0, 0, AW, AH).data), rects: patchRects(ref.pts, AH) };
+  return autoRef;
+}
+function autoStat(text, go) { const el = $('autoStat'); el.textContent = text; el.classList.toggle('go', !!go); }
+function beep() {
+  if (!audio) return;
+  try { const o = audio.createOscillator(), g = audio.createGain(); o.frequency.value = 880; g.gain.value = .15;
+    o.connect(g); g.connect(audio.destination); o.start(); o.stop(audio.currentTime + .15); } catch (e) {}
+}
+function setAuto(on) {
+  auto = on; holdStart = 0;
+  $('autoBtn').setAttribute('aria-pressed', String(on));
+  $('autoBtn').textContent = on ? 'Auto on' : 'Auto';
+  $('autoStat').hidden = !on;
+  clearInterval(autoTimer); autoTimer = null;
+  if (!on) return;
+  try { if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)(); if (audio.state === 'suspended') audio.resume(); } catch (e) {}
+  autoStat('Looking for a match…');
+  autoTimer = setInterval(autoTick, 150);
+}
+async function autoTick() {
+  if (autoBusy || !auto) return;
+  autoBusy = true;
+  try {
+    if (!video.videoWidth) { autoStat('Start the camera first'); return; }
+    if (!$('review').hidden || !$('sheet').hidden || !$('anchors').hidden || playing || rendering) { holdStart = 0; return; }
+    const ref = refFrame();
+    if (!ref) { autoStat('Take a first photo to match against'); return; }
+    const AH = Math.round(AW * video.videoHeight / video.videoWidth);
+    const r = await autoPrepRef(ref, AH);
+    if (r.bad) { autoStat('The reference photo is a different shape from the camera'); return; }
+    probe.width = AW; probe.height = AH; pg.drawImage(video, 0, 0, AW, AH);
+    const score = matchScore(r.gray, toGray(pg.getImageData(0, 0, AW, AH).data), r.rects), pct = Math.round(score * 100);
+    if (!auto) return;
+    if (score * 100 >= S.autoThr) {
+      if (!holdStart) holdStart = performance.now();
+      const left = S.autoHold - (performance.now() - holdStart) / 1000;
+      if (left > 0) { autoStat('Hold still ' + left.toFixed(1) + ' s · ' + pct + '%', true); return; }
+      setAuto(false); beep(); capture();       // one photo, then Auto switches itself off
+    } else {
+      holdStart = 0;
+      autoStat('Match ' + pct + '% · needs ' + S.autoThr + '%' + (ref.pts ? '' : ' · set anchor points for a steadier match'));
+    }
+  } catch (e) { /* skip this tick */ } finally { autoBusy = false; }
+}
+
 /* ---------- controls ---------- */
 const confirms = [['delOne', 'Delete'], ['newProj', 'New project'], ['openProj', 'Open project file']];
 let confirmTimer = null;
@@ -821,6 +906,7 @@ function twoTap(id, fn, needed) {         // first tap arms, second tap within 3
 }
 $('start').onclick = startCam;
 $('shutter').onclick = capture;
+$('autoBtn').onclick = () => setAuto(!auto);
 $('keep').onclick = endReview;
 $('retake').onclick = () => { const id = reviewId; endReview(); if (id !== null) removeFrame(id); };
 $('flip').onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; startCam(); };
